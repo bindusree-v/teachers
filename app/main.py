@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from app.database import Base, engine, get_db, SessionLocal
 from app.schemas import (
     StudentDashboardResponse, TeacherDashboardResponse,
@@ -30,6 +31,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+def ensure_video_schema_compatibility():
+    """Apply lightweight schema guards for older databases."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS topic VARCHAR(50)"))
+            conn.execute(text("UPDATE videos SET topic = 'lm' WHERE topic IS NULL"))
+    except Exception as e:
+        print(f"⚠️  Warning: Could not apply video schema compatibility fixes: {e}")
+
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +55,7 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     """Initialize database with seed data"""
+    ensure_video_schema_compatibility()
     db = SessionLocal()
     try:
         seed_data(db)
