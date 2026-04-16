@@ -37,11 +37,24 @@ class TeacherStudentItem(BaseModel):
     is_logged_in: bool
     is_active: bool
 
+class CourseAnalyticsItem(BaseModel):
+    course_id: int
+    course_name: str
+    enrolled_students: int
+    completed_students: int
+    total_topics: int
+    total_assessments: int
+    total_videos: int
+    total_assessment_submissions: int
+    attendance_count: int
+    average_mastery: float
+
 class TeacherDashboardResponse(BaseModel):
     total_students: int
     active_students: int
     inactive_students: int
     students: List[TeacherStudentItem]
+    course_analytics: List[CourseAnalyticsItem]
 
 # ==================== Recommendation Models ====================
 class RecommendationResponse(BaseModel):
@@ -175,3 +188,38 @@ class BatchUpdateResponse(BaseModel):
     records_processed: int
     updated_recommendation: Optional[RecommendationResponse]
     updated_difficulty: Optional[str]
+
+# ==================== Auth Models ====================
+class AuthSignupRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+    role: str  # student | teacher
+
+class AuthLoginRequest(BaseModel):
+    email: str
+    password: str
+    role: str  # student | teacher
+
+class AuthLogoutRequest(BaseModel):
+    user_id: int
+
+class AuthResponse(BaseModel):
+    success: bool
+    message: str
+    user_id: int
+    username: str
+    email: str
+    role: str
+
+class AuthRoleStats(BaseModel):
+    signup_count: int
+    login_count: int
+    active_count: int
+    inactive_count: int
+
+class AuthStatsResponse(BaseModel):
+    students: AuthRoleStats
+    teachers: AuthRoleStats
+    total_users: int
+    updated_at: str

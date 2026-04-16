@@ -1,7 +1,8 @@
 from sqlalchemy.orm import Session
 from app.models import (
     Student, Recommendation, TopicProgress, PerformanceData,
-    KnowledgeState, PathVersion, TeacherOverride, DifficultyLog
+    KnowledgeState, PathVersion, TeacherOverride, DifficultyLog,
+    Course, Topic, Video, StudentProgress, AssessmentResult, Assessment
 )
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -519,29 +520,105 @@ def get_student_dashboard(db: Session, student_id: int):
     }
 
 def get_teacher_dashboard(db: Session):
-    """Get teacher dashboard with all students"""
-    students = db.query(Student).all()
-    total = len(students)
-    active = len([s for s in students if s.is_active])
-    inactive = total - active
+    """Get teacher dashboard with all students and course analytics"""
+    try:
+        students = db.query(Student).all()
+        total = len(students)
+        active = len([s for s in students if s.is_active])
+        inactive = total - active
 
-    return {
-        "total_students": total,
-        "active_students": active,
-        "inactive_students": inactive,
-        "students": [
-            {
-                "id": s.id,
-                "name": s.name,
-                "current_topic": s.current_topic,
-                "mastery": s.mastery,
-                "weak_area": s.weak_area,
-                "is_logged_in": s.is_logged_in,
-                "is_active": s.is_active
-            }
-            for s in students
-        ]
-    }
+        # Get course analytics
+        courses = db.query(Course).all()
+        course_analytics = []
+        
+        for course in courses:
+            # Get topics for this course
+            topics = db.query(Topic).filter(Topic.course_id == course.id).all()
+            topic_ids = [t.id for t in topics]
+
+            # Get assessments for this course
+            assessments = db.query(Assessment).filter(Assessment.course_id == course.id).all()
+
+            # Get videos for this course
+            videos = db.query(Video).filter(Video.topic.in_([t.title for t in topics])).all() if topics else []
+
+            # Get student progress for this course - safely
+            student_progress = []
+            try:
+                student_progress = db.query(StudentProgress).filter(StudentProgress.course_id == course.id).all()
+            except:
+                student_progress = []
+
+            enrolled_students = len(student_progress)
+            completed_students = len([p for p in student_progress if p.status == 'completed']) if student_progress else 0
+
+            # Get assessment results for this course - safely
+            assessment_results = []
+            try:
+                assessment_results = db.query(AssessmentResult).filter(
+                    AssessmentResult.assessment_id.in_([a.id for a in assessments])
+                ).all() if assessments else []
+            except:
+                assessment_results = []
+
+            # Get attendance data
+            attendance_records = []
+            try:
+                attendance_records = db.query(PerformanceData).filter(
+                    PerformanceData.topic_name.in_([t.title for t in topics])
+                ).all() if topics else []
+            except:
+                attendance_records = []
+
+            # Calculate average mastery
+            avg_mastery = 0
+            if enrolled_students > 0 and student_progress:
+                try:
+                    avg_mastery = sum([p.progress_percentage for p in student_progress if hasattr(p, 'progress_percentage')]) / enrolled_students
+                except:
+                    avg_mastery = 0
+
+            course_analytics.append({
+                "course_id": course.id,
+                "course_name": course.name,
+                "enrolled_students": enrolled_students,
+                "completed_students": completed_students,
+                "total_topics": len(topics),
+                "total_assessments": len(assessments),
+                "total_videos": len(videos),
+                "total_assessment_submissions": len(assessment_results),
+                "attendance_count": len(attendance_records),
+                "average_mastery": avg_mastery
+            })
+
+        return {
+            "total_students": total,
+            "active_students": active,
+            "inactive_students": inactive,
+            "students": [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "current_topic": s.current_topic,
+                    "mastery": s.mastery,
+                    "weak_area": s.weak_area,
+                    "is_logged_in": s.is_logged_in,
+                    "is_active": s.is_active
+                }
+                for s in students
+            ],
+            "course_analytics": course_analytics
+        }
+    except Exception as e:
+        print(f"Error in get_teacher_dashboard: {e}")
+        return {
+            "total_students": 0,
+            "active_students": 0,
+            "inactive_students": 0,
+            "students": [],
+            "course_analytics": [],
+            "error": str(e)
+        }
 
 def get_student_analytics(db: Session, student_id: int) -> Dict:
     """Get detailed student analytics"""

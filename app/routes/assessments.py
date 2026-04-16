@@ -1,11 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app import models
 from pydantic import BaseModel
 from datetime import datetime
+import os
+import shutil
+from pathlib import Path
+import random
+import json
+import re
+from PyPDF2 import PdfReader
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessments"])
+
+# Create uploads directory if it doesn't exist
+UPLOAD_DIR = Path("uploads/assessments")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 class SubmitAssessmentRequest(BaseModel):
     student_id: int
@@ -14,6 +25,7 @@ class SubmitAssessmentRequest(BaseModel):
 class CreateAssessmentRequest(BaseModel):
     title: str
     description: str
+    course_id: int
     topic_id: int
     assessment_type: str = "quiz"
     passing_score: int = 70
@@ -27,8 +39,8 @@ class CreateQuestionRequest(BaseModel):
     points: int = 1
 
 @router.get("/{assessment_id}")
-def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
-    """Get assessment with questions"""
+def get_assessment(assessment_id: int, student_id: int = None, db: Session = Depends(get_db)):
+    """Get assessment with questions (randomized for each student)"""
     assessment = db.query(models.Assessment).filter(models.Assessment.id == assessment_id).first()
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -36,6 +48,11 @@ def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
     questions = db.query(models.AssessmentQuestion).filter(
         models.AssessmentQuestion.assessment_id == assessment_id
     ).all()
+
+    # Randomize questions for each student to prevent cheating
+    if student_id:
+        random.seed(student_id + assessment_id)  # Deterministic randomization per student
+        questions = random.sample(questions, len(questions))
 
     return {
         "assessment": {
@@ -224,5 +241,149 @@ def create_assessment(request: CreateAssessmentRequest, db: Session = Depends(ge
             "passing_score": assessment.passing_score,
             "time_limit_minutes": assessment.time_limit_minutes,
             "questions_count": len(request.questions)
+        }
+    }
+
+@router.post("/create-from-pdf")
+async def create_assessment_from_pdf(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    description: str = Form(""),
+    course_id: int = Form(...),
+    topic_id: int = Form(...),
+    assessment_type: str = Form("quiz"),
+    passing_score: int = Form(70),
+    time_limit_minutes: int = Form(30),
+    db: Session = Depends(get_db)
+):
+    """Create assessment from PDF upload with random question selection"""
+    # Validate file type
+    if file.content_type != 'application/pdf':
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+
+    # Validate file size (max 10MB)
+    max_size = 10 * 1024 * 1024  # 10MB
+    file_content = await file.read()
+    if len(file_content) > max_size:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB.")
+
+    # Check if topic exists
+    topic = db.query(models.Topic).filter(models.Topic.id == topic_id).first()
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    # Save PDF file
+    file_extension = os.path.splitext(file.filename)[1]
+    unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{title.replace(' ', '_')}{file_extension}"
+    file_path = UPLOAD_DIR / unique_filename
+
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+    # Parse PDF to extract questions
+    try:
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse PDF: {str(e)}")
+
+    # Parse questions from text
+    # Expected format:
+    # Question 1: What is 2+2?
+    # A) 3
+    # B) 4
+    # C) 5
+    # D) 6
+    # Correct: B
+    questions = []
+    question_pattern = r'Question \d+:\s*(.*?)(?=Question \d+:|$)'
+    option_pattern = r'([A-D])\)\s*(.*?)(?=[A-D]\)|Correct:|$)'
+    correct_pattern = r'Correct:\s*([A-D])'
+
+    question_matches = re.findall(question_pattern, text, re.DOTALL | re.IGNORECASE)
+
+    for i, question_text in enumerate(question_matches):
+        question_text = question_text.strip()
+        if not question_text:
+            continue
+
+        # Find options for this question
+        start_pos = text.find(f"Question {i+1}:")
+        if start_pos == -1:
+            continue
+
+        next_question_pos = text.find(f"Question {i+2}:", start_pos)
+        if next_question_pos == -1:
+            next_question_pos = len(text)
+
+        question_block = text[start_pos:next_question_pos]
+
+        # Extract options
+        options = {}
+        option_matches = re.findall(option_pattern, question_block, re.IGNORECASE)
+        for letter, option_text in option_matches:
+            options[letter.upper()] = option_text.strip()
+
+        # Extract correct answer
+        correct_match = re.search(correct_pattern, question_block, re.IGNORECASE)
+        correct_answer = correct_match.group(1).upper() if correct_match else None
+
+        if options and correct_answer and correct_answer in options:
+            questions.append({
+                "question_text": question_text,
+                "question_type": "mcq",
+                "options": {**options, "correct": correct_answer},
+                "points": 1
+            })
+
+    if not questions:
+        raise HTTPException(status_code=400, detail="No valid questions found in PDF. Please ensure questions are formatted as: Question 1: [text] A) [option] B) [option] C) [option] D) [option] Correct: [A-D]")
+
+    # Create assessment
+    assessment = models.Assessment(
+        title=title,
+        description=description,
+        course_id=course_id,
+        topic_id=topic_id,
+        assessment_type=assessment_type,
+        passing_score=passing_score,
+        time_limit_minutes=time_limit_minutes
+    )
+
+    db.add(assessment)
+    db.commit()
+    db.refresh(assessment)
+
+    # Create questions
+    for q_data in questions:
+        question = models.AssessmentQuestion(
+            assessment_id=assessment.id,
+            question_text=q_data["question_text"],
+            question_type=q_data["question_type"],
+            options=q_data.get("options"),
+            points=q_data.get("points", 1)
+        )
+        db.add(question)
+
+    db.commit()
+
+    return {
+        "success": True,
+        "assessment": {
+            "id": assessment.id,
+            "title": assessment.title,
+            "description": assessment.description,
+            "course_id": assessment.course_id,
+            "topic_id": assessment.topic_id,
+            "assessment_type": assessment.assessment_type,
+            "passing_score": assessment.passing_score,
+            "time_limit_minutes": assessment.time_limit_minutes,
+            "questions_count": len(questions),
+            "pdf_path": str(file_path)
         }
     }

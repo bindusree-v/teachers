@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 from app.database import Base, engine, get_db, SessionLocal
 from app.schemas import (
     StudentDashboardResponse, TeacherDashboardResponse,
@@ -9,7 +8,8 @@ from app.schemas import (
     DoubtDataRequest, PerformanceDataResponse, DifficultyCalibrationResponse,
     RecommendationResponse, TeacherOverrideRequest, TeacherOverrideResponse,
     PathHistoryResponse, StudentAnalyticsResponse, KnowledgeStateResponse,
-    BatchPerformanceUpdate, BatchUpdateResponse
+    BatchPerformanceUpdate, BatchUpdateResponse, AuthSignupRequest,
+    AuthLoginRequest, AuthLogoutRequest, AuthResponse, AuthStatsResponse
 )
 from app.services import (
     get_student_dashboard, get_teacher_dashboard, get_student_analytics,
@@ -31,16 +31,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
-def ensure_video_schema_compatibility():
-    """Apply lightweight schema guards for older databases."""
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS topic VARCHAR(50)"))
-            conn.execute(text("UPDATE videos SET topic = 'lm' WHERE topic IS NULL"))
-    except Exception as e:
-        print(f"⚠️  Warning: Could not apply video schema compatibility fixes: {e}")
-
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +45,6 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     """Initialize database with seed data"""
-    ensure_video_schema_compatibility()
     db = SessionLocal()
     try:
         seed_data(db)
@@ -505,3 +494,176 @@ def reset_database(db: Session = Depends(get_db)):
 # ==================== EXPORTS ====================
 
 from datetime import datetime
+import re
+
+EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9]+@(gmail\.com|email\.com)$")
+PASSWORD_PATTERN = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$")
+
+def _validate_auth_payload(email: str, password: str, role: str):
+    normalized_role = (role or "").strip().lower()
+    if normalized_role not in {"student", "teacher"}:
+        raise HTTPException(status_code=400, detail="Role must be student or teacher")
+    if not EMAIL_PATTERN.match((email or "").strip().lower()):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+    if not PASSWORD_PATTERN.match(password or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain uppercase, lowercase, number, special character and 8+ chars",
+        )
+    return normalized_role
+
+def _build_auth_stats(db: Session):
+    from app.models import AppUser
+
+    all_users = db.query(AppUser).all()
+
+    def role_stats(role: str):
+        role_users = [u for u in all_users if u.role == role]
+        return {
+            "signup_count": len(role_users),
+            "login_count": sum((u.login_count or 0) for u in role_users),
+            "active_count": len([u for u in role_users if u.is_active]),
+            "inactive_count": len([u for u in role_users if not u.is_active]),
+        }
+
+    return {
+        "students": role_stats("student"),
+        "teachers": role_stats("teacher"),
+        "total_users": len(all_users),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+@app.post("/auth/signup", response_model=AuthResponse)
+def auth_signup(payload: AuthSignupRequest, db: Session = Depends(get_db)):
+    from app.models import AppUser, AuthEvent, Student, Teacher
+
+    normalized_email = payload.email.strip().lower()
+    role = _validate_auth_payload(normalized_email, payload.password, payload.role)
+
+    username = (payload.username or "").strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+
+    if db.query(AppUser).filter(AppUser.email == normalized_email).first():
+        raise HTTPException(status_code=409, detail="Email already exists")
+    if db.query(AppUser).filter(AppUser.password == payload.password).first():
+        raise HTTPException(status_code=409, detail="Password already exists. Use unique password")
+
+    app_user = AppUser(
+        username=username,
+        email=normalized_email,
+        password=payload.password,
+        role=role,
+        login_count=1,
+        is_active=True,
+        last_login_at=datetime.utcnow(),
+    )
+    db.add(app_user)
+    db.flush()
+
+    if role == "student":
+        existing_student = db.query(Student).filter(Student.email == normalized_email).first()
+        if not existing_student:
+            db.add(
+                Student(
+                    name=username,
+                    email=normalized_email,
+                    current_topic="Introduction to LearnPath",
+                    completed_topics=0,
+                    assessments_taken=0,
+                    strong_area="Foundations",
+                    weak_area="Foundations",
+                    mastery=0.0,
+                    is_logged_in=True,
+                    is_active=True,
+                )
+            )
+    else:
+        existing_teacher = db.query(Teacher).filter(Teacher.email == normalized_email).first()
+        if not existing_teacher:
+            db.add(
+                Teacher(
+                    name=username,
+                    email=normalized_email,
+                    subject="General",
+                    expertise_areas=[],
+                    is_active=True,
+                )
+            )
+
+    db.add(AuthEvent(user_id=app_user.id, role=role, event_type="signup"))
+    db.commit()
+    db.refresh(app_user)
+
+    return {
+        "success": True,
+        "message": "Signup successful",
+        "user_id": app_user.id,
+        "username": app_user.username,
+        "email": app_user.email,
+        "role": app_user.role,
+    }
+
+@app.post("/auth/login", response_model=AuthResponse)
+def auth_login(payload: AuthLoginRequest, db: Session = Depends(get_db)):
+    from app.models import AppUser, AuthEvent, Student
+
+    normalized_email = payload.email.strip().lower()
+    role = _validate_auth_payload(normalized_email, payload.password, payload.role)
+
+    user = db.query(AppUser).filter(
+        AppUser.email == normalized_email,
+        AppUser.password == payload.password,
+        AppUser.role == role,
+    ).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials or role mismatch")
+
+    user.login_count = (user.login_count or 0) + 1
+    user.is_active = True
+    user.last_login_at = datetime.utcnow()
+
+    if role == "student":
+        student = db.query(Student).filter(Student.email == normalized_email).first()
+        if student:
+            student.is_logged_in = True
+            student.is_active = True
+            student.updated_at = datetime.utcnow()
+
+    db.add(AuthEvent(user_id=user.id, role=role, event_type="login"))
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "success": True,
+        "message": "Login successful",
+        "user_id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+    }
+
+@app.post("/auth/logout")
+def auth_logout(payload: AuthLogoutRequest, db: Session = Depends(get_db)):
+    from app.models import AppUser, AuthEvent, Student
+
+    user = db.query(AppUser).filter(AppUser.id == payload.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.is_active = False
+    if user.role == "student":
+        student = db.query(Student).filter(Student.email == user.email).first()
+        if student:
+            student.is_logged_in = False
+            student.is_active = False
+            student.updated_at = datetime.utcnow()
+
+    db.add(AuthEvent(user_id=user.id, role=user.role, event_type="logout"))
+    db.commit()
+
+    return {"success": True, "message": "Logout successful"}
+
+@app.get("/auth/stats", response_model=AuthStatsResponse)
+def auth_stats(db: Session = Depends(get_db)):
+    return _build_auth_stats(db)

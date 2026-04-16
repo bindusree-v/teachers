@@ -3,6 +3,29 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.database import Base
 
+class AppUser(Base):
+    __tablename__ = "app_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password = Column(String, unique=True, nullable=False)
+    role = Column(String, nullable=False, index=True)  # student | teacher
+    login_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=False)
+    last_login_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class AuthEvent(Base):
+    __tablename__ = "auth_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("app_users.id"), nullable=False, index=True)
+    role = Column(String, nullable=False, index=True)  # student | teacher
+    event_type = Column(String, nullable=False, index=True)  # signup | login | logout
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 class Student(Base):
     __tablename__ = "students"
 
